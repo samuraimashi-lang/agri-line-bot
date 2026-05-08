@@ -39,14 +39,14 @@ app = Flask(__name__)
 LINE_TOKEN  = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 LINE_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 CLAUDE_KEY  = os.environ["ANTHROPIC_API_KEY"]
-OPENAI_KEY  = os.environ["OPENAI_API_KEY"]
+OPENAI_KEY  = os.environ.get("OPENAI_API_KEY", "")  # 音声認識用（任意）
 WEATHER_KEY = os.environ.get("WEATHER_API_KEY", "")
 SHEET_NAME  = os.environ.get("SHEET_NAME", "農作業記録")
 
 line_bot_api  = LineBotApi(LINE_TOKEN)
 handler       = WebhookHandler(LINE_SECRET)
 claude        = anthropic.Anthropic(api_key=CLAUDE_KEY)
-openai_client = OpenAI(api_key=OPENAI_KEY)
+openai_client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
 # ======================================================
 # ★ 圃場マスタ（実際の座標に変更してください）
@@ -98,6 +98,8 @@ def get_weather(lat: float = 38.38, lon: float = 140.40) -> str:
 
 def transcribe_audio(audio_bytes: bytes) -> str:
     """OpenAI Whisper で音声をテキストに変換する。"""
+    if not openai_client:
+        raise RuntimeError("OPENAI_API_KEY が設定されていません")
     with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as f:
         f.write(audio_bytes)
         tmp = f.name
