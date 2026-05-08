@@ -140,7 +140,6 @@ def parse_work(text: str, weather: str, field: dict | None) -> dict:
 JSONのみ返してください（説明文は不要）:
 {{
   "作業項目":   "選択肢から最も近いもの",
-  "作業エリア": "エリア名・列番号など（不明なら空欄）",
   "完了数量":   "本数・列数など（不明なら空欄）",
   "気づき課題": "問題点・特記事項（なければ空欄）",
   "不足項目":   ["必須なのに不明な項目のリスト。天気・圃場は自動取得済みなので除く"]
@@ -172,7 +171,6 @@ def fill_missing(text: str, missing_items: list, current_parsed: dict) -> dict:
 JSONのみ返してください（説明文不要）:
 {{
   "作業項目":   "既存の値、または追加入力で更新された値",
-  "作業エリア": "既存の値、または追加入力で更新された値",
   "完了数量":   "既存の値、または追加入力で更新された値",
   "気づき課題": "既存の値、または追加入力で更新された値",
   "不足項目":   ["まだ不明な必須項目のリスト（解決済みは除く）"]
@@ -195,7 +193,6 @@ def build_confirm_text(parsed: dict, weather: str, field: dict | None) -> str:
         f"🌾 圃場　　　：{fn}",
         f"🌤 天気　　　：{weather}",
         f"🔨 作業項目　：{parsed.get('作業項目','不明')}",
-        f"📍 作業エリア：{parsed.get('作業エリア','（未入力）') or '（未入力）'}",
         f"📊 完了数量　：{parsed.get('完了数量','（未入力）') or '（未入力）'}",
     ]
     if parsed.get("気づき課題"):
@@ -236,7 +233,7 @@ def save_to_sheet(uid: str, parsed: dict, weather: str, field: dict | None):
         sheet.append_row([
             "日付", "時刻", "作業者ID",
             "圃場グループ", "圃場名", "面積(a)",
-            "作業項目", "作業エリア", "完了数量",
+            "作業項目", "完了数量",
             "天気", "気づき・課題",
         ])
 
@@ -249,7 +246,6 @@ def save_to_sheet(uid: str, parsed: dict, weather: str, field: dict | None):
         field["name"]   if field else "",
         field["area_a"] if field else "",
         parsed.get("作業項目", ""),
-        parsed.get("作業エリア", ""),
         parsed.get("完了数量", ""),
         weather,
         parsed.get("気づき課題", ""),
