@@ -462,15 +462,36 @@ def on_text(event):
     uid  = event.source.user_id
     text = event.message.text.strip()
 
-    # --- 作業開始 → タイマースタート ---
+    # --- 作業開始 → タイマースタート＆位置情報要求 ---
     if text in ["作業開始", "開始"]:
         _work_start[uid] = datetime.now(JST)
-        _pending.pop(uid, None)  # 前回の入力途中データをリセット
-        save_work_start_to_sheet(uid, _work_start[uid])   # シートに永続保存
+        _pending[uid] = {"mode": "start_loc"}  # 位置情報待ちモード
+        save_work_start_to_sheet(uid, _work_start[uid])
         now_str = _work_start[uid].strftime("%H:%M")
         reply = (
             f"⏱ 作業開始を記録しました（{now_str}）\n\n"
-            "📍 まず現在地の位置情報を送ってください\n"
+            "📍 現在地の位置情報を送ってください\n"
+            "（下のボタンをタップするだけでOK）"
+        )
+        quick_reply = QuickReply(items=[
+            QuickReplyButton(action=LocationAction(label="📍 位置情報を送る"))
+        ])
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply, quick_reply=quick_reply)
+        )
+        return
+
+    # --- 作業終了 → 位置情報要求 ---
+    if text in ["作業終了", "終了"]:
+        ctx = _pending.get(uid, {})
+        ctx.pop("parsed", None)   # 前回の解析結果をクリア
+        ctx.pop("missing", None)
+        ctx["mode"] = "end_loc"   # 位置情報待ちモード（終了）
+        _pending[uid] = ctx
+        reply = (
+            "✅ お疲れさまです！\n\n"
+            "📍 現在地の位置情報を送ってください\n"
             "（下のボタンをタップするだけでOK）"
         )
         quick_reply = QuickReply(items=[
@@ -526,13 +547,17 @@ def on_text(event):
     if text in ["ヘルプ", "help", "使い方", "？"]:
         reply = (
             "【農作業記録Bot 使い方】\n\n"
-            "1️⃣ 「作業開始」と送るとタイマースタート\n\n"
-            "2️⃣ 位置情報を送ると圃場を自動判定します\n"
-            "   ＋ボタン → 位置情報 → 現在地を送信\n\n"
-            "3️⃣ 作業内容を音声または文字で送ってください\n"
+            "1️⃣ 「作業開始」と送る\n"
+            "   → 位置情報ボタンが表示されます\n\n"
+            "2️⃣ ボタンをタップして位置情報を送る\n"
+            "   → 圃場が自動判定されます\n\n"
+            "3️⃣ 作業が終わったら「作業終了」と送る\n"
+            "   → 位置情報ボタンが表示されます\n\n"
+            "4️⃣ ボタンをタップして位置情報を送る\n"
+            "   → 作業内容の入力を促されます\n\n"
+            "5️⃣ 作業内容を音声または文字で送る\n"
             "   例：「せん定終わり、北3〜5列、120本」\n\n"
-            "4️⃣ 内容を確認して「OK」で記録完了\n"
-            "   ※ 作業時間が自動で計算されます\n\n"
+            "6️⃣「OK」で記録完了（作業時間も自動保存）\n\n"
             "📝 修正 → 内容を送り直す\n"
             "❌ 取消 → 「キャンセル」と送る\n"
             "📋 圃場確認 → 「圃場一覧」と送る"
@@ -587,22 +612,58 @@ def on_location(event):
     field = detect_field(lat, lon)
     _pending.setdefault(uid, {})
     _pending[uid].update({"field": field, "lat": lat, "lon": lon})
+    mode = _pending[uid].get("mode", "")
 
-    if field:
+    field_str = (
+        f"{field['group']} / {field['name']}（{field['area_a']}a）"
+        if field else "登録済み圃場が見つかりませんでした"
+    )
+
+    if mode == "start_loc":
+        # 作業開始 → 位置情報受信：圃場確認して「作業終了」を案内
+        _pending[uid]["mode"] = "working"
         reply = (
-            f"📍 圃場を検知しました！\n"
-            f"　{field['group']} / {field['name']}（{field['area_a']}a）\n\n"
-            f"作業内容を音声または文字で送ってください 🎤\n"
-            f"例：「せん定終わり、北3〜5列、120本」"
+            f"📍 {field_str}\n\n"
+            "👍 作業を開始してください！\n"
+            "終わったら「作業終了」と送ってください"
         )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
+    elif mode == "end_loc":
+        # 作業終了 → 位置情報受信：経過時間を表示して作業内容の入力を促す
+        _pending[uid]["mode"] = "end_recording"
+
+        wt_line = ""
+        start_dt = _work_start.get(uid)
+        if start_dt:
+            elapsed_min = int((datetime.now(JST) - start_dt).total_seconds() / 60)
+            h, m = divmod(elapsed_min, 60)
+            wt_line = f"\n⏱ 作業時間：{h}時間{m}分（{start_dt.strftime('%H:%M')}〜）"
+
+        reply = (
+            f"📍 {field_str}{wt_line}\n\n"
+            "🔨 作業内容を入力してください\n"
+            "例：「せん定終わり、北3〜5列、120本」"
+        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
     else:
-        reply = (
-            "📍 位置情報を受け取りましたが\n"
-            "登録済み圃場が見つかりませんでした。\n\n"
-            "作業内容に圃場名を含めて送ってください。\n"
-            "例：「荒谷①でせん定、北3列完了」"
-        )
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        # 通常の位置情報送信（作業開始/終了コマンドなし）
+        if field:
+            reply = (
+                f"📍 圃場を検知しました！\n"
+                f"　{field_str}\n\n"
+                "作業内容を音声または文字で送ってください 🎤\n"
+                "例：「せん定終わり、北3〜5列、120本」"
+            )
+        else:
+            reply = (
+                "📍 位置情報を受け取りましたが\n"
+                "登録済み圃場が見つかりませんでした。\n\n"
+                "作業内容に圃場名を含めて送ってください。\n"
+                "例：「荒谷①でせん定、北3列完了」"
+            )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
 
 # ======================================================
