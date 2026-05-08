@@ -277,6 +277,7 @@ JSONのみ返してください（説明文は不要）:
 {{
   "作業項目":   "選択肢から最も近いもの",
   "完了数量":   "本数・列数など（不明なら空欄）",
+  "天気":       "入力に天気（晴れ・曇り・雨など）があれば記載、なければ空欄",
   "気づき課題": "問題点・特記事項（なければ空欄）",
   "不足項目":   ["必須なのに不明な項目のリスト。天気・圃場は自動取得済みなので除く"]
 }}"""
@@ -426,6 +427,10 @@ def _process_text(uid: str, text: str, reply_token: str):
     else:
         weather = get_weather(lat, lon)
         parsed  = parse_work(text, weather, field)
+
+    # ユーザーが天気を入力していればそちらを優先（自動取得より正確）
+    if parsed.get("天気"):
+        weather = parsed["天気"]
 
     missing = parsed.get("不足項目", [])
     _pending[uid] = {**ctx, "parsed": parsed, "weather": weather, "missing": missing}
