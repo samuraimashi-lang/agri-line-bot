@@ -28,7 +28,7 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, TextMessage, AudioMessage, LocationMessage,
-    TextSendMessage,
+    TextSendMessage, QuickReply, QuickReplyButton, LocationAction,
 )
 
 import anthropic
@@ -358,37 +358,49 @@ def build_confirm_text(parsed: dict, weather: str, field: dict | None,
 
 
 def save_to_sheet(uid: str, parsed: dict, weather: str, field: dict | None):
-    """Google Sheets に1行追記する。"""
+    """Google Sheets に1行追記する（常にA列から書き込む）。"""
     client = get_gspread_client()
     sheet  = client.open(SHEET_NAME).sheet1
 
     # 作業時間の計算
     start_dt = _work_start.pop(uid, None)
-    now = datetime.now()
+    now = datetime.now(JST)
     if start_dt:
-        elapsed_min = int((now - start_dt).total_seconds() / 60)
-        h, m = divmod(elapsed_min, 60)
-        work_time    = f"{h}時間{m}分" if h > 0 else f"{m}分"
+        elapsed_min    = int((now - start_dt).total_seconds() / 60)
+        h, m           = divmod(elapsed_min, 60)
+        work_time      = f"{h}時間{m}分" if h > 0 else f"{m}分"
         start_time_str = start_dt.strftime("%H:%M")
     else:
         work_time      = ""
         start_time_str = ""
 
-    # 1行目にヘッダーがなければ追加
-    if not sheet.get_all_values():
-        sheet.append_row([
-            "日付", "開始時刻", "終了時刻", "作業時間", "作業者ID",
-            "圃場グループ", "圃場名", "面積(a)",
-            "作業項目", "完了数量",
-            "天気", "気づき・課題",
-        ])
+    # LINE表示名を取得
+    try:
+        display_name = line_bot_api.get_profile(uid).display_name
+    except Exception:
+        display_name = ""
 
-    sheet.append_row([
+    # 現在の行数を取得して次の書き込み行を決定（常にA列から始まる）
+    all_vals = sheet.get_all_values()
+    next_row = len(all_vals) + 1
+
+    # シートが空ならヘッダーを1行目に追加
+    if next_row == 1:
+        sheet.update([
+            ["日付", "作業者名", "作業者ID", "開始時刻", "終了時刻", "作業時間",
+             "圃場グループ", "圃場名", "面積(a)",
+             "作業項目", "完了数量", "天気", "気づき・課題"]
+        ], "A1")
+        next_row = 2
+
+    # データ行を書き込む
+    row_data = [
         now.strftime("%Y-%m-%d"),
+        display_name,
+        uid,
         start_time_str,
         now.strftime("%H:%M"),
         work_time,
-        uid,
         field["group"]  if field else "",
         field["name"]   if field else "",
         field["area_a"] if field else "",
@@ -396,7 +408,8 @@ def save_to_sheet(uid: str, parsed: dict, weather: str, field: dict | None):
         parsed.get("完了数量", ""),
         weather,
         parsed.get("気づき課題", ""),
-    ])
+    ]
+    sheet.update([row_data], f"A{next_row}")
 
 
 def _process_text(uid: str, text: str, reply_token: str):
@@ -457,10 +470,16 @@ def on_text(event):
         now_str = _work_start[uid].strftime("%H:%M")
         reply = (
             f"⏱ 作業開始を記録しました（{now_str}）\n\n"
-            "作業が終わったら内容を送ってください 🌾\n"
-            "例：「せん定終わり、北3〜5列、120本」"
+            "📍 まず現在地の位置情報を送ってください\n"
+            "（下のボタンをタップするだけでOK）"
         )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        quick_reply = QuickReply(items=[
+            QuickReplyButton(action=LocationAction(label="📍 位置情報を送る"))
+        ])
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply, quick_reply=quick_reply)
+        )
         return
 
     # --- OK → 保存 ---
