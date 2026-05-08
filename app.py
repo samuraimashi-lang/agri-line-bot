@@ -15,6 +15,12 @@ AIが自動で整理してGoogleスプレッドシートに保存します。
 import os, json, tempfile, math, time
 from datetime import datetime
 
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+JST = pytz.timezone("Asia/Tokyo")
+
 import requests
 from flask import Flask, request, abort
 
@@ -104,6 +110,93 @@ _pending = {}
 
 # ユーザーごとの作業開始時刻（「作業開始」コマンドでセット）
 _work_start: dict[str, datetime] = {}
+
+
+# ======================================================
+# 作業状態シート（開始・完了をGoogleSheetsに永続保存）
+# ======================================================
+
+def get_status_sheet():
+    """「作業状態」シートを返す（なければ自動作成）。"""
+    ss = get_gspread_client().open(SHEET_NAME)
+    try:
+        return ss.worksheet("作業状態")
+    except Exception:
+        ws = ss.add_worksheet(title="作業状態", rows=1000, cols=4)
+        ws.append_row(["日付", "作業者ID", "開始時刻", "ステータス"])
+        return ws
+
+
+def save_work_start_to_sheet(uid: str, start_dt: datetime):
+    """「開始中」行をシートに追記する。"""
+    try:
+        ws = get_status_sheet()
+        ws.append_row([
+            start_dt.strftime("%Y-%m-%d"),
+            uid,
+            start_dt.strftime("%H:%M"),
+            "開始中",
+        ])
+    except Exception as e:
+        print(f"[作業状態] 書き込みエラー: {e}")
+
+
+def mark_work_status(uid: str, status: str):
+    """今日の最新「開始中」行を指定ステータスに更新する。"""
+    try:
+        ws   = get_status_sheet()
+        today = datetime.now(JST).strftime("%Y-%m-%d")
+        rows  = ws.get_all_values()
+        for i in range(len(rows) - 1, -1, -1):
+            row = rows[i]
+            if len(row) >= 4 and row[0] == today and row[1] == uid and row[3] == "開始中":
+                ws.update_cell(i + 1, 4, status)  # 1-indexed
+                break
+    except Exception as e:
+        print(f"[作業状態] 更新エラー: {e}")
+
+
+# ======================================================
+# 18時の未完了通知
+# ======================================================
+
+def send_evening_reminders():
+    """毎日18時JST に、作業未完了者へ名指しでLINE通知を送る。"""
+    try:
+        ws    = get_status_sheet()
+        today = datetime.now(JST).strftime("%Y-%m-%d")
+        rows  = ws.get_all_values()
+
+        # 今日「開始中」のままのユーザーIDを収集
+        pending_uids = set()
+        for row in rows:
+            if len(row) >= 4 and row[0] == today and row[3] == "開始中":
+                pending_uids.add(row[1])
+
+        if not pending_uids:
+            return  # 全員完了済み
+
+        for uid in pending_uids:
+            try:
+                # LINE表示名を取得して名指しメッセージを送る
+                profile = line_bot_api.get_profile(uid)
+                name    = profile.display_name
+                msg = (
+                    f"⏰ {name}さん、18時になりました。\n\n"
+                    "本日の作業記録がまだ未完了です。\n\n"
+                    "📍 場所が変わっている場合は、先に\n"
+                    "「位置情報」を送ってください。\n"
+                    "（＋ボタン → 位置情報 → 現在地）\n\n"
+                    "その後、作業内容を送ってください。\n\n"
+                    "今日の記録が不要な場合は\n"
+                    "「キャンセル」と送ってください。"
+                )
+                line_bot_api.push_message(uid, TextSendMessage(text=msg))
+            except Exception as e:
+                print(f"[18時通知] {uid} への送信エラー: {e}")
+
+    except Exception as e:
+        print(f"[18時通知] 全体エラー: {e}")
 
 
 # ======================================================
@@ -358,8 +451,9 @@ def on_text(event):
 
     # --- 作業開始 → タイマースタート ---
     if text in ["作業開始", "開始"]:
-        _work_start[uid] = datetime.now()
+        _work_start[uid] = datetime.now(JST)
         _pending.pop(uid, None)  # 前回の入力途中データをリセット
+        save_work_start_to_sheet(uid, _work_start[uid])   # シートに永続保存
         now_str = _work_start[uid].strftime("%H:%M")
         reply = (
             f"⏱ 作業開始を記録しました（{now_str}）\n\n"
@@ -377,6 +471,7 @@ def on_text(event):
         else:
             try:
                 save_to_sheet(uid, ctx["parsed"], ctx["weather"], ctx.get("field"))
+                mark_work_status(uid, "完了")   # 作業状態シートを更新
                 _pending.pop(uid, None)
                 reply = "✅ 記録しました！\nお疲れさまでした🍎"
             except Exception as e:
@@ -401,6 +496,8 @@ def on_text(event):
     # --- キャンセル ---
     if text in ["キャンセル", "取消", "やめる"]:
         _pending.pop(uid, None)
+        _work_start.pop(uid, None)
+        mark_work_status(uid, "キャンセル")  # 作業状態シートを更新
         line_bot_api.reply_message(
             event.reply_token, TextSendMessage(text="入力をキャンセルしました。")
         )
@@ -487,6 +584,17 @@ def on_location(event):
             "例：「荒谷①でせん定、北3列完了」"
         )
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
+
+# ======================================================
+# スケジューラー起動（毎日18時JST に未完了者へ通知）
+# ======================================================
+_scheduler = BackgroundScheduler(timezone=JST)
+_scheduler.add_job(
+    send_evening_reminders,
+    CronTrigger(hour=18, minute=0, timezone=JST),
+)
+_scheduler.start()
 
 
 # ======================================================
