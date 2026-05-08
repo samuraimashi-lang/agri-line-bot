@@ -262,7 +262,7 @@ def parse_work(text: str, weather: str, field: dict | None) -> dict:
 【自動取得済み情報】
 圃場: {field_hint}
 天気: {weather}
-日時: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+日時: {datetime.now(JST).strftime('%Y-%m-%d %H:%M')}
 
 【作業項目の選択肢（最も近いものを選ぶ）】
 せん定 / 整枝 / 下垂誘引 / 芽傷入れ / ねぎ袋作業 /
@@ -325,7 +325,7 @@ def build_confirm_text(parsed: dict, weather: str, field: dict | None,
                        work_start: datetime | None = None) -> str:
     """農家への確認メッセージを組み立てる。"""
     fn = f"{field['group']} / {field['name']}" if field else "不明（位置情報を送ってください）"
-    now = datetime.now()
+    now = datetime.now(JST)
     lines = [
         "📋 以下の内容で記録します\n",
         f"🌾 圃場　　　：{fn}",
