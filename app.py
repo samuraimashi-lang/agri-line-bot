@@ -29,6 +29,7 @@ import anthropic
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from openai import OpenAI
+import base64, tempfile
 
 # ======================================================
 # アプリ初期化
@@ -186,7 +187,13 @@ def save_to_sheet(uid: str, parsed: dict, weather: str, field: dict | None):
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds  = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    # 環境変数からcredentials.jsonを取得（base64エンコード済み）
+    creds_b64 = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+    if creds_b64:
+        creds_dict = json.loads(base64.b64decode(creds_b64).decode())
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    else:
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
     client = gspread.authorize(creds)
     sheet  = client.open(SHEET_NAME).sheet1
 
