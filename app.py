@@ -12,7 +12,7 @@ AIが自動で整理してGoogleスプレッドシートに保存します。
   ⑤ 「OK」で Google Sheets に自動保存
 """
 
-import os, json, tempfile, math
+import os, json, tempfile, math, time
 from datetime import datetime
 
 import requests
@@ -49,15 +49,55 @@ claude        = anthropic.Anthropic(api_key=CLAUDE_KEY)
 openai_client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
 # ======================================================
-# ★ 圃場マスタ（実際の座標に変更してください）
+# 圃場マスタ（Googleスプレッドシート「圃場マスタ」シートから読み込む）
 # ======================================================
-FIELDS = [
-    {"name": "荒谷①",  "group": "天童", "lat": 38.3500, "lon": 140.3800, "area_a": 17},
-    {"name": "神町",    "group": "東根", "lat": 38.4300, "lon": 140.4200, "area_a": 48},
-    {"name": "大谷",    "group": "天童", "lat": 38.3600, "lon": 140.3900, "area_a": 30},
-    {"name": "蟹沢",   "group": "東根", "lat": 38.4100, "lon": 140.4100, "area_a": 20},
-]
 FIELD_DETECT_RADIUS_M = 300   # この距離（m）以内なら圃場と判定
+FIELDS_CACHE_TTL      = 300   # 5分キャッシュ
+_fields_cache      = []
+_fields_cache_time = 0.0
+
+
+def get_gspread_client():
+    """Google Sheets クライアントを返す（共通処理）。"""
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds_b64 = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+    if creds_b64:
+        creds_dict = json.loads(base64.b64decode(creds_b64).decode())
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    else:
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    return gspread.authorize(creds)
+
+
+def load_fields(force: bool = False) -> list:
+    """スプレッドシートの「圃場マスタ」シートから圃場一覧を読み込む（5分キャッシュ）。"""
+    global _fields_cache, _fields_cache_time
+    if not force and _fields_cache and (time.time() - _fields_cache_time) < FIELDS_CACHE_TTL:
+        return _fields_cache
+    try:
+        sheet  = get_gspread_client().open(SHEET_NAME).worksheet("圃場マスタ")
+        rows   = sheet.get_all_records()
+        fields = []
+        for row in rows:
+            try:
+                fields.append({
+                    "name":   str(row.get("圃場名", "")).strip(),
+                    "group":  str(row.get("グループ", "")).strip(),
+                    "lat":    float(row.get("緯度", 0)),
+                    "lon":    float(row.get("経度", 0)),
+                    "area_a": row.get("面積(a)", ""),
+                })
+            except (ValueError, TypeError):
+                continue
+        _fields_cache      = fields
+        _fields_cache_time = time.time()
+        return fields
+    except Exception:
+        return _fields_cache  # エラー時は古いキャッシュを返す
+
 
 # ユーザーごとの入力途中データを一時保持（サーバー再起動でリセットされます）
 _pending = {}
@@ -70,7 +110,7 @@ _pending = {}
 def detect_field(lat: float, lon: float) -> dict | None:
     """GPS座標から最寄り圃場を返す。範囲外はNone。"""
     best, best_dist = None, float("inf")
-    for f in FIELDS:
+    for f in load_fields():
         dlat = (lat - f["lat"]) * 111_000
         dlon = (lon - f["lon"]) * 111_000 * math.cos(math.radians(lat))
         dist = math.sqrt(dlat**2 + dlon**2)
@@ -214,18 +254,7 @@ def build_confirm_text(parsed: dict, weather: str, field: dict | None) -> str:
 
 def save_to_sheet(uid: str, parsed: dict, weather: str, field: dict | None):
     """Google Sheets に1行追記する。"""
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    # 環境変数からcredentials.jsonを取得（base64エンコード済み）
-    creds_b64 = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
-    if creds_b64:
-        creds_dict = json.loads(base64.b64decode(creds_b64).decode())
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    else:
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-    client = gspread.authorize(creds)
+    client = get_gspread_client()
     sheet  = client.open(SHEET_NAME).sheet1
 
     # 1行目にヘッダーがなければ追加
@@ -314,6 +343,20 @@ def on_text(event):
                 reply = "✅ 記録しました！\nお疲れさまでした🍎"
             except Exception as e:
                 reply = f"⚠️ 保存エラーが発生しました。\n管理者に連絡してください。\n({e})"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    # --- 圃場マスタ更新 ---
+    if text in ["圃場更新", "圃場リスト", "圃場一覧"]:
+        fields = load_fields(force=True)
+        if fields:
+            lines = [f"📋 圃場マスタ（{len(fields)}件）\n"]
+            for f in fields:
+                lines.append(f"🌾 {f['group']} / {f['name']}（{f['area_a']}a）")
+            lines.append("\nスプレッドシートの「圃場マスタ」シートを編集後\n「圃場更新」と送ると反映されます")
+            reply = "\n".join(lines)
+        else:
+            reply = "⚠️ 圃場マスタが読み込めませんでした。\nスプレッドシートに「圃場マスタ」シートがあるか確認してください。"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
