@@ -155,6 +155,38 @@ JSONのみ返してください（説明文は不要）:
     return json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
 
 
+def fill_missing(text: str, missing_items: list, current_parsed: dict) -> dict:
+    """不足項目への追加入力から情報を補完する。"""
+    prompt = f"""農家が不足していた情報を追加で入力しました。
+
+【追加入力】
+{text}
+
+【現在の記録内容】
+{json.dumps(current_parsed, ensure_ascii=False, indent=2)}
+
+【まだ不足していた項目】
+{', '.join(missing_items)}
+
+追加入力の内容を現在の記録内容に反映してください。
+JSONのみ返してください（説明文不要）:
+{{
+  "作業項目":   "既存の値、または追加入力で更新された値",
+  "作業エリア": "既存の値、または追加入力で更新された値",
+  "完了数量":   "既存の値、または追加入力で更新された値",
+  "気づき課題": "既存の値、または追加入力で更新された値",
+  "不足項目":   ["まだ不明な必須項目のリスト（解決済みは除く）"]
+}}"""
+
+    msg = claude.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = msg.content[0].text
+    return json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
+
+
 def build_confirm_text(parsed: dict, weather: str, field: dict | None) -> str:
     """農家への確認メッセージを組み立てる。"""
     fn = f"{field['group']} / {field['name']}" if field else "不明（位置情報を送ってください）"
@@ -172,10 +204,10 @@ def build_confirm_text(parsed: dict, weather: str, field: dict | None) -> str:
 
     missing = parsed.get("不足項目", [])
     if missing:
-        lines += ["", "⚠️ 以下が不足しています："]
+        lines += ["", "⚠️ 以下を教えてください："]
         for m in missing:
-            lines.append(f"  → {m}を教えてください")
-        lines.append("\n内容を追加して送り直してください。")
+            lines.append(f"  → {m}は？")
+        lines.append("\n（不足している情報だけ送ってください）")
     else:
         lines += ["", "✅「OK」と送ると記録が完了します"]
         lines.append("修正する場合は内容を送り直してください")
@@ -226,14 +258,21 @@ def save_to_sheet(uid: str, parsed: dict, weather: str, field: dict | None):
 
 def _process_text(uid: str, text: str, reply_token: str):
     """テキスト・音声共通の処理ロジック。"""
-    ctx     = _pending.get(uid, {})
-    field   = ctx.get("field")
-    lat     = ctx.get("lat", 38.38)
-    lon     = ctx.get("lon", 140.40)
-    weather = get_weather(lat, lon)
-    parsed  = parse_work(text, weather, field)
+    ctx   = _pending.get(uid, {})
+    field = ctx.get("field")
+    lat   = ctx.get("lat", 38.38)
+    lon   = ctx.get("lon", 140.40)
 
-    _pending[uid] = {**ctx, "parsed": parsed, "weather": weather}
+    # 不足項目への追加入力なら補完モード（前回データ＋今回入力をマージ）
+    if "parsed" in ctx and ctx.get("missing"):
+        weather = ctx.get("weather", get_weather(lat, lon))
+        parsed  = fill_missing(text, ctx["missing"], ctx["parsed"])
+    else:
+        weather = get_weather(lat, lon)
+        parsed  = parse_work(text, weather, field)
+
+    missing = parsed.get("不足項目", [])
+    _pending[uid] = {**ctx, "parsed": parsed, "weather": weather, "missing": missing}
 
     reply = build_confirm_text(parsed, weather, field)
     line_bot_api.reply_message(reply_token, TextSendMessage(text=reply))
