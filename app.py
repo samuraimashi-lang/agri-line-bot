@@ -102,6 +102,9 @@ def load_fields(force: bool = False) -> list:
 # ユーザーごとの入力途中データを一時保持（サーバー再起動でリセットされます）
 _pending = {}
 
+# ユーザーごとの作業開始時刻（「作業開始」コマンドでセット）
+_work_start: dict[str, datetime] = {}
+
 
 # ======================================================
 # 補助関数
@@ -225,9 +228,11 @@ JSONのみ返してください（説明文不要）:
     return json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
 
 
-def build_confirm_text(parsed: dict, weather: str, field: dict | None) -> str:
+def build_confirm_text(parsed: dict, weather: str, field: dict | None,
+                       work_start: datetime | None = None) -> str:
     """農家への確認メッセージを組み立てる。"""
     fn = f"{field['group']} / {field['name']}" if field else "不明（位置情報を送ってください）"
+    now = datetime.now()
     lines = [
         "📋 以下の内容で記録します\n",
         f"🌾 圃場　　　：{fn}",
@@ -237,7 +242,14 @@ def build_confirm_text(parsed: dict, weather: str, field: dict | None) -> str:
     ]
     if parsed.get("気づき課題"):
         lines.append(f"📝 気づき　　：{parsed['気づき課題']}")
-    lines.append(f"⏰ 記録時刻　：{datetime.now().strftime('%H:%M')}")
+    lines.append(f"⏰ 記録時刻　：{now.strftime('%H:%M')}")
+
+    # 作業開始時刻が記録されていれば作業時間を表示
+    if work_start:
+        elapsed_min = int((now - work_start).total_seconds() / 60)
+        h, m = divmod(elapsed_min, 60)
+        wt_str = f"{h}時間{m}分" if h > 0 else f"{m}分"
+        lines.append(f"⏱ 作業時間　：{wt_str}（{work_start.strftime('%H:%M')}〜）")
 
     missing = parsed.get("不足項目", [])
     if missing:
@@ -257,19 +269,32 @@ def save_to_sheet(uid: str, parsed: dict, weather: str, field: dict | None):
     client = get_gspread_client()
     sheet  = client.open(SHEET_NAME).sheet1
 
+    # 作業時間の計算
+    start_dt = _work_start.pop(uid, None)
+    now = datetime.now()
+    if start_dt:
+        elapsed_min = int((now - start_dt).total_seconds() / 60)
+        h, m = divmod(elapsed_min, 60)
+        work_time    = f"{h}時間{m}分" if h > 0 else f"{m}分"
+        start_time_str = start_dt.strftime("%H:%M")
+    else:
+        work_time      = ""
+        start_time_str = ""
+
     # 1行目にヘッダーがなければ追加
     if not sheet.get_all_values():
         sheet.append_row([
-            "日付", "時刻", "作業者ID",
+            "日付", "開始時刻", "終了時刻", "作業時間", "作業者ID",
             "圃場グループ", "圃場名", "面積(a)",
             "作業項目", "完了数量",
             "天気", "気づき・課題",
         ])
 
-    now = datetime.now()
     sheet.append_row([
         now.strftime("%Y-%m-%d"),
+        start_time_str,
         now.strftime("%H:%M"),
+        work_time,
         uid,
         field["group"]  if field else "",
         field["name"]   if field else "",
@@ -299,7 +324,7 @@ def _process_text(uid: str, text: str, reply_token: str):
     missing = parsed.get("不足項目", [])
     _pending[uid] = {**ctx, "parsed": parsed, "weather": weather, "missing": missing}
 
-    reply = build_confirm_text(parsed, weather, field)
+    reply = build_confirm_text(parsed, weather, field, _work_start.get(uid))
     line_bot_api.reply_message(reply_token, TextSendMessage(text=reply))
 
 
@@ -330,6 +355,19 @@ def health():
 def on_text(event):
     uid  = event.source.user_id
     text = event.message.text.strip()
+
+    # --- 作業開始 → タイマースタート ---
+    if text in ["作業開始", "開始"]:
+        _work_start[uid] = datetime.now()
+        _pending.pop(uid, None)  # 前回の入力途中データをリセット
+        now_str = _work_start[uid].strftime("%H:%M")
+        reply = (
+            f"⏱ 作業開始を記録しました（{now_str}）\n\n"
+            "作業が終わったら内容を送ってください 🌾\n"
+            "例：「せん定終わり、北3〜5列、120本」"
+        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
 
     # --- OK → 保存 ---
     if text.upper() in ["OK", "ＯＫ", "確認", "保存", "記録"]:
@@ -372,13 +410,16 @@ def on_text(event):
     if text in ["ヘルプ", "help", "使い方", "？"]:
         reply = (
             "【農作業記録Bot 使い方】\n\n"
-            "1️⃣ まず位置情報を送ると圃場を自動判定します\n"
+            "1️⃣ 「作業開始」と送るとタイマースタート\n\n"
+            "2️⃣ 位置情報を送ると圃場を自動判定します\n"
             "   ＋ボタン → 位置情報 → 現在地を送信\n\n"
-            "2️⃣ 作業内容を音声または文字で送ってください\n"
+            "3️⃣ 作業内容を音声または文字で送ってください\n"
             "   例：「せん定終わり、北3〜5列、120本」\n\n"
-            "3️⃣ 内容を確認して「OK」で記録完了\n\n"
+            "4️⃣ 内容を確認して「OK」で記録完了\n"
+            "   ※ 作業時間が自動で計算されます\n\n"
             "📝 修正 → 内容を送り直す\n"
-            "❌ 取消 → 「キャンセル」と送る"
+            "❌ 取消 → 「キャンセル」と送る\n"
+            "📋 圃場確認 → 「圃場一覧」と送る"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
